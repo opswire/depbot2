@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <build>
+    <plugins>
+
+      <!-- jib: образ на отдельной строке с отступами -->
+      <plugin>
+        <groupId>com.google.cloud.tools</groupId>
+        <artifactId>jib-maven-plugin</artifactId>
+        <configuration>
+          <from>
+            <image>
+              gcr.io/distroless/java17:1.0.0
+            </image>
+          </from>
+          <to>
+            <image>
+              myregistry.io/myapp:2.3.1
+            </image>
+          </to>
+        </configuration>
+      </plugin>
+
+      <!-- docker-maven-plugin: baseImage на отдельной строке -->
+      <plugin>
+        <groupId>io.fabric8</groupId>
+        <artifactId>docker-maven-plugin</artifactId>
+        <configuration>
+          <baseImage>
+            docker.io/eclipse-temurin/17-jre-alpine:17.0.9
+          </baseImage>
+        </configuration>
+      </plugin>
+
+    </plugins>
+  </build>
+</project>
