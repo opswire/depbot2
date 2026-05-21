@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  web:
+    image: docker.io/library/nginx:1.25.3
+  app:
+    image: "ghcr.io/myorg/myapp:2.1.0"
+  worker:
+    image: 'ghcr.io/myorg/worker:1.0.4'
+  cache:
+    # нон-semver — пропускается
+    image: redis:latest
+  db:
+    # нет домена — пропускается
+    image: postgres:15.4
