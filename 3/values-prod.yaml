@@ -1,0 +1,5 @@
+# Prod overrides
+image:
+  repository: ghcr.io/myorg/myapp
+  tag: "2.0.5"
+  pullPolicy: Always
