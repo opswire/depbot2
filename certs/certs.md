@@ -1,6 +1,8 @@
 # Определение клиента MCP-сервера по `X-Forwarded-Client-Cert`
 
-Как MCP-серверу на Go понять, кто пришёл (**MCP Gateway** или **агент**), когда mTLS принимает не сам сервер, а прокси перед ним: Envoy, Istio, sidecar. В этом документе: что поменять в коде, что проверить в настройках прокси и как всё протестировать локально на Windows.
+Как MCP-серверу на Go понять, кто пришёл, **MCP Gateway** или **агент**, когда mTLS принимает прокси (Envoy / Istio), а не сам сервер.
+
+**Правило:** если CN клиентского сертификата подходит под один из шаблонов `gateway_cns`, это gateway. Любой другой CN — агент.
 
 ---
 
@@ -11,22 +13,20 @@
 ```
 
 1. Прокси принимает TLS, проверяет клиентский сертификат по CA и отклоняет чужие.
-2. В запрос к приложению прокси добавляет заголовок `X-Forwarded-Client-Cert` (XFCC) с данными сертификата.
-3. Go-сервер работает на обычном HTTP, читает CN из XFCC и выбирает ветку логики.
+2. В запрос к приложению прокси добавляет заголовок `X-Forwarded-Client-Cert` (XFCC):
+   ```
+   X-Forwarded-Client-Cert: Hash=fad64460...;Subject="CN=mcp-gateway";URI=
+   ```
+3. Go-сервер работает на обычном HTTP, берёт CN из `Subject` и выбирает ветку.
 
-Пример заголовка, который реально приходит от Envoy:
+Особенности формата:
 
-```
-X-Forwarded-Client-Cert: Hash=fad64460...;Subject="CN=mcp-gateway";URI=
-```
+- В заголовке может быть **несколько элементов через запятую**, по одному от каждого прокси. **Последний элемент добавил ближайший к приложению прокси**, а предыдущие мог прислать сам клиент.
+- Значения бывают в кавычках, и внутри них встречаются запятые: `Subject="CN=mcp-gateway,O=Acme"`. Поэтому обычный `strings.Split` не подходит.
 
-### Формат XFCC
+### Почему без готовой библиотеки
 
-- Заголовок может содержать **несколько элементов через запятую**: по одному от каждого прокси на пути запроса. **Последний элемент добавил ближайший к приложению прокси.**
-- Внутри элемента пары `ключ=значение` идут через `;`. Значения могут быть в кавычках, а внутри кавычек могут встречаться `,` и `;`: `Subject="CN=mcp-gateway,O=Acme"`.
-- Основные ключи: `Subject` (DN сертификата, в нём CN), `URI` (SAN URI, в Istio это SPIFFE ID), `Hash`, `By`, `DNS`.
-
-Поэтому разбирать заголовок через `strings.Split(h, ",")` нельзя, нужен парсер, который учитывает кавычки (он ниже).
+Поддерживаемой Go-библиотеки для XFCC нет: отдельный `xfccparser` заброшен, а `envoyutil` входит в большой `blend/go-sdk`. Для разбора DN есть `ldap.ParseDN` из `go-ldap`, но тянуть LDAP-клиент ради одной функции не стоит. Нужной логики примерно 30 строк на стандартной библиотеке, и они покрыты тестами ниже.
 
 ---
 
@@ -34,21 +34,15 @@ X-Forwarded-Client-Cert: Hash=fad64460...;Subject="CN=mcp-gateway";URI=
 
 ### 2.1. Убрать TLS из Go-сервера
 
-Теперь TLS принимает прокси, поэтому `TLSConfig`, `ClientCAs`, серверный сертификат и `ListenAndServeTLS` из сервера убираются:
+TLS теперь принимает прокси, поэтому `TLSConfig`, `ClientCAs`, серверный сертификат и `ListenAndServeTLS` из сервера убираются. Сервер слушает обычный HTTP:
 
 ```go
-// было
-srv.ListenAndServeTLS("server.crt", "server.key")
-
-// стало
 srv := &http.Server{
-	Addr:    cfg.ListenAddr, // например "127.0.0.1:8080"
+	Addr:    cfg.ListenAddr, // "127.0.0.1:8080"
 	Handler: classifier.Middleware(mcpHandler),
 }
 log.Fatal(srv.ListenAndServe())
 ```
-
-`r.TLS` теперь всегда `nil`, и проверку через `r.TLS.VerifiedChains` нужно удалить.
 
 ### 2.2. Конфиг
 
@@ -56,42 +50,39 @@ log.Fatal(srv.ListenAndServe())
 listen_addr: 127.0.0.1:8080
 
 client_auth:
-  gateway_cns: [mcp-gateway]
-  agent_cns:   [ai-agent]
-  # Пусто: клиент берётся из последнего элемента XFCC (один прокси перед приложением).
-  # Заполнено: см. раздел 3.3 (цепочка ingress → sidecar).
-  trusted_proxy_uris: []
+  # Регулярки для CN gateway. Совпадение всегда полное (^...$ добавляется в коде).
+  # Всё, что не подошло, считается агентом.
+  gateway_cns:
+    - 'mcp-gateway'                # ровно mcp-gateway
+    - 'mcp-gateway(-[a-z0-9]+)*'   # mcp-gateway, mcp-gateway-1, mcp-gateway-prod-eu
 ```
 
-### 2.3. Код: `xfcc.go`
+```go
+type ClientAuthConfig struct {
+	GatewayCNs []string `yaml:"gateway_cns"`
+}
+```
+
+### 2.3. Код: `client.go`
 
 ```go
 package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
 type ClientKind int
 
 const (
-	ClientUnknown ClientKind = iota
-	ClientAgent
+	ClientAgent ClientKind = iota
 	ClientGateway
 )
-
-func (k ClientKind) String() string {
-	switch k {
-	case ClientAgent:
-		return "agent"
-	case ClientGateway:
-		return "gateway"
-	}
-	return "unknown"
-}
 
 type ctxKey struct{}
 
@@ -100,22 +91,20 @@ func ClientKindFrom(ctx context.Context) ClientKind {
 	return k
 }
 
-const xfccHeader = "X-Forwarded-Client-Cert"
+// cnRe находит CN в DN вида "CN=mcp-gateway,O=Acme" (учитывает экранированные \,).
+var cnRe = regexp.MustCompile(`(?:^|,)\s*CN=((?:\\.|[^,\\])*)`)
 
-// splitUnquoted делит строку по sep, игнорируя разделители внутри "..." (с учётом \").
-func splitUnquoted(s string, sep byte) []string {
+// splitOutsideQuotes делит s по sep, пропуская sep внутри "...".
+func splitOutsideQuotes(s string, sep byte) []string {
 	var parts []string
-	inQuotes, escaped, start := false, false, 0
+	inQuotes, start := false, 0
 	for i := 0; i < len(s); i++ {
-		c := s[i]
 		switch {
-		case escaped:
-			escaped = false
-		case c == '\\':
-			escaped = true
-		case c == '"':
+		case s[i] == '\\':
+			i++ // пропускаем экранированный символ
+		case s[i] == '"':
 			inQuotes = !inQuotes
-		case c == sep && !inQuotes:
+		case s[i] == sep && !inQuotes:
 			parts = append(parts, s[start:i])
 			start = i + 1
 		}
@@ -123,129 +112,66 @@ func splitUnquoted(s string, sep byte) []string {
 	return append(parts, s[start:])
 }
 
-func unquote(v string) string {
-	v = strings.TrimSpace(v)
-	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-		v = strings.ReplaceAll(v[1:len(v)-1], `\"`, `"`)
-	}
-	return v
-}
-
-// parseXFCCElement разбирает один элемент: Key=Value;Key="Value"
-func parseXFCCElement(elem string) map[string]string {
-	m := map[string]string{}
-	for _, kv := range splitUnquoted(elem, ';') {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
-		m[strings.ToLower(strings.TrimSpace(k))] = unquote(v)
-	}
-	return m
-}
-
-// cnFromSubject достаёт CN из DN вида "CN=mcp-gateway,O=Acme".
-func cnFromSubject(dn string) string {
-	for _, rdn := range splitDN(dn) {
-		k, v, ok := strings.Cut(rdn, "=")
-		if ok && strings.EqualFold(strings.TrimSpace(k), "CN") {
-			return strings.TrimSpace(unescapeDN(v))
+// ClientCN возвращает CN клиента из последнего элемента XFCC:
+// его добавил ближайший прокси, предыдущие элементы мог прислать клиент.
+func ClientCN(r *http.Request) string {
+	elems := splitOutsideQuotes(strings.Join(r.Header.Values("X-Forwarded-Client-Cert"), ","), ',')
+	for _, kv := range splitOutsideQuotes(elems[len(elems)-1], ';') {
+		if k, v, ok := strings.Cut(kv, "="); ok && strings.EqualFold(strings.TrimSpace(k), "Subject") {
+			if m := cnRe.FindStringSubmatch(strings.Trim(strings.TrimSpace(v), `"`)); m != nil {
+				return strings.ReplaceAll(m[1], `\`, "")
+			}
 		}
 	}
 	return ""
 }
 
-// splitDN делит DN по запятым, не экранированным через "\".
-func splitDN(dn string) []string {
-	var parts []string
-	escaped, start := false, 0
-	for i := 0; i < len(dn); i++ {
-		switch {
-		case escaped:
-			escaped = false
-		case dn[i] == '\\':
-			escaped = true
-		case dn[i] == ',' || dn[i] == '+':
-			parts = append(parts, dn[start:i])
-			start = i + 1
+type Classifier struct{ gateway []*regexp.Regexp }
+
+func NewClassifier(gatewayPatterns []string) (*Classifier, error) {
+	c := &Classifier{}
+	for _, p := range gatewayPatterns {
+		re, err := regexp.Compile(`^(?:` + p + `)$`) // всегда полное совпадение
+		if err != nil {
+			return nil, fmt.Errorf("bad gateway CN pattern %q: %w", p, err)
+		}
+		c.gateway = append(c.gateway, re)
+	}
+	return c, nil
+}
+
+func (c *Classifier) Kind(cn string) ClientKind {
+	for _, re := range c.gateway {
+		if re.MatchString(cn) {
+			return ClientGateway
 		}
 	}
-	return append(parts, dn[start:])
+	return ClientAgent
 }
 
-func unescapeDN(v string) string {
-	var b strings.Builder
-	for i := 0; i < len(v); i++ {
-		if v[i] == '\\' && i+1 < len(v) {
-			i++
-		}
-		b.WriteByte(v[i])
-	}
-	return b.String()
-}
-
-// ClientCNFromXFCC возвращает CN клиента из XFCC.
-// trustedProxyURIs пустой: клиент — последний элемент (его добавил ближайший прокси).
-// trustedProxyURIs задан: последний элемент должен быть от доверенного прокси
-// (например, Istio ingress gateway), а клиент — предпоследний элемент.
-func ClientCNFromXFCC(r *http.Request, trustedProxyURIs map[string]bool) string {
-	values := r.Header.Values(xfccHeader)
-	if len(values) == 0 {
-		return ""
-	}
-	elems := splitUnquoted(strings.Join(values, ","), ',')
-	last := parseXFCCElement(elems[len(elems)-1])
-	if len(trustedProxyURIs) == 0 {
-		return cnFromSubject(last["subject"])
-	}
-	if len(elems) < 2 || !trustedProxyURIs[last["uri"]] {
-		return ""
-	}
-	return cnFromSubject(parseXFCCElement(elems[len(elems)-2])["subject"])
-}
-
-type CNClassifier struct {
-	roles            map[string]ClientKind
-	trustedProxyURIs map[string]bool
-}
-
-func NewCNClassifier(gatewayCNs, agentCNs, trustedProxyURIs []string) *CNClassifier {
-	m := map[string]ClientKind{}
-	for _, cn := range gatewayCNs {
-		m[cn] = ClientGateway
-	}
-	for _, cn := range agentCNs {
-		m[cn] = ClientAgent
-	}
-	t := map[string]bool{}
-	for _, u := range trustedProxyURIs {
-		t[u] = true
-	}
-	return &CNClassifier{roles: m, trustedProxyURIs: t}
-}
-
-func (c *CNClassifier) Middleware(next http.Handler) http.Handler {
+func (c *Classifier) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cn := ClientCNFromXFCC(r, c.trustedProxyURIs)
-		kind := c.roles[cn]
-		if kind == ClientUnknown {
-			log.Printf("rejected client: CN=%q", cn)
+		cn := ClientCN(r)
+		if cn == "" { // нет XFCC — запрос пришёл не через прокси
+			log.Printf("rejected: no client CN in X-Forwarded-Client-Cert")
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, kind)))
+		ctx := context.WithValue(r.Context(), ctxKey{}, c.Kind(cn))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 ```
 
+Запрос без XFCC отклоняется с 403, а не считается агентом. Отсутствие заголовка означает, что запрос пришёл в обход прокси или прокси настроен неправильно. Если такие запросы всё-таки нужно пропускать как агента, уберите блок `if cn == ""`.
+
 ### 2.4. Подключение и использование
 
 ```go
-classifier := NewCNClassifier(
-	cfg.ClientAuth.GatewayCNs,
-	cfg.ClientAuth.AgentCNs,
-	cfg.ClientAuth.TrustedProxyURIs,
-)
+classifier, err := NewClassifier(cfg.ClientAuth.GatewayCNs)
+if err != nil {
+	log.Fatal(err) // кривая регулярка в конфиге — падаем при старте
+}
 
 srv := &http.Server{
 	Addr:    cfg.ListenAddr,
@@ -256,10 +182,9 @@ srv := &http.Server{
 В обработчике MCP-инструмента:
 
 ```go
-switch ClientKindFrom(ctx) {
-case ClientGateway:
+if ClientKindFrom(ctx) == ClientGateway {
 	// логика для MCP Gateway
-case ClientAgent:
+} else {
 	// логика для агента
 }
 ```
@@ -270,65 +195,32 @@ case ClientAgent:
 
 ## 3. Безопасность: когда XFCC можно доверять
 
-Заголовок — это просто текст. Кто может отправить запрос в приложение напрямую, тот может написать в нём что угодно. Поэтому код безопасен **только** при выполнении трёх условий.
+Заголовок — это просто текст. Код безопасен только при соблюдении трёх условий.
 
-### 3.1. Приложение недоступно в обход прокси
+1. **Приложение недоступно в обход прокси.** Если Envoy работает отдельным sidecar, приложение слушает только `127.0.0.1`. В Istio нужен `PeerAuthentication` с `mode: STRICT`, а порт приложения не должен быть опубликован мимо прокси.
+2. **Прокси не пробрасывает XFCC клиента как есть.** В Envoy это параметр `forward_client_cert_details`:
+   - `SANITIZE_SET` — лучший вариант: прокси удаляет заголовок клиента и ставит свой.
+   - `APPEND_FORWARD` тоже подходит: прокси дописывает свой элемент в конец, а код читает именно последний.
+   - `FORWARD_ONLY` **нельзя**: клиент сможет подделать CN.
+3. **В XFCC есть `Subject`.** В Envoy для этого нужно `set_current_client_cert_details.subject: true`.
 
-- Если Envoy работает отдельным sidecar, слушайте только `127.0.0.1:8080`.
-- В Istio входящий трафик пода перехватывается sidecar, но mTLS должен быть строгим: `PeerAuthentication` с `mode: STRICT`. В режиме `PERMISSIVE` sidecar пропускает plaintext-запросы, и клиент без сертификата может прислать свой XFCC.
-- Не публикуйте порт приложения через Service или NodePort мимо прокси.
+Цена ошибки выше, чем раньше. Теперь любой CN, не похожий на gateway, — это агент, поэтому подделать нужно только CN gateway. А шаблоны в `gateway_cns` должны быть узкими: `mcp-gateway.*` пропустит и `mcp-gatewayEVIL`.
 
-### 3.2. Прокси очищает заголовок от клиента
+### Если прокси два (Istio: ingress gateway → sidecar)
 
-В Envoy за это отвечает `forward_client_cert_details`:
+Тогда последний элемент XFCC добавляет sidecar, и в нём описан сам **ingress gateway**: в элементе есть только `URI=spiffe://...` и нет `Subject`. CN клиента окажется в **предпоследнем** элементе, и текущий код вернёт 403.
 
-| Режим | Что делает | Подходит |
-|---|---|---|
-| `SANITIZE_SET` | удаляет XFCC клиента и ставит свой | ✅ лучший вариант для внешнего входа |
-| `APPEND_FORWARD` | оставляет XFCC клиента и **дописывает свой элемент в конец** | ✅ только если код читает последний элемент (так и сделано) |
-| `FORWARD_ONLY` | пробрасывает заголовок клиента как есть | ❌ клиент может подделать CN |
-| `SANITIZE` | удаляет XFCC, ничего не ставит | ❌ CN не дойдёт |
+**Перед выкаткой залогируйте реальный заголовок** `r.Header.Values("X-Forwarded-Client-Cert")` на своём окружении. Если элемент в нём один, код подходит как есть. Если элементов два, код нужно доработать: проверять, что `URI` последнего элемента принадлежит вашему ingress, и брать CN из предпоследнего. Без проверки URI любой под в mesh сможет подделать CN.
 
-Плюс `set_current_client_cert_details.subject: true`, иначе в XFCC не будет `Subject` (а значит, и CN).
-
-Проверено на Envoy 1.31: в режиме `APPEND_FORWARD` агент отправил `X-Forwarded-Client-Cert: Subject="CN=mcp-gateway"`. До приложения дошло `Subject="CN=mcp-gateway",Hash=...;Subject="CN=ai-agent"`, код взял последний элемент и определил клиента как **агента**. Подделка не сработала.
-
-### 3.3. Если прокси несколько (Istio: ingress gateway → sidecar)
-
-Типичная схема в Istio:
-
-```
-клиент ──mTLS──▶ istio-ingressgateway ──mesh mTLS──▶ sidecar ──▶ приложение
-```
-
-Здесь последний элемент XFCC добавляет sidecar, и описывает он **ingress gateway**: в нём есть `URI=spiffe://.../istio-ingressgateway-service-account` и нет `Subject`. Сертификат клиента с `CN=mcp-gateway` будет в **предпоследнем** элементе.
-
-Для такой схемы заполните `trusted_proxy_uris`:
-
-```yaml
-trusted_proxy_uris:
-  - spiffe://cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
-```
-
-Код тогда:
-
-1. Проверяет, что последний элемент добавлен для доверенного ingress (по `URI`).
-2. Берёт CN из предпоследнего элемента.
-3. Если запрос пришёл от любого другого workload в mesh, отклоняет его. Без этой проверки любой под в кластере мог бы прислать поддельный XFCC.
-
-**Сначала посмотрите реальный заголовок на своём окружении.** Временно залогируйте `r.Header.Values("X-Forwarded-Client-Cert")`, чтобы понять, сколько там элементов и какой URI у прокси. После этого логирование уберите.
-
-> Ещё один нюанс Istio: у сертификатов workload внутри mesh **нет CN**, только SPIFFE URI. CN есть только у внешних клиентов со своими сертификатами, которые проходят через ingress. Если gateway и агент живут внутри mesh, различать их нужно по `URI` (ServiceAccount), а не по CN.
+> У сервисов внутри Istio в сертификатах обычно **нет CN**, только SPIFFE URI. Если gateway работает внутри mesh, различать клиентов нужно по `URI`, а не по CN.
 
 ---
 
 ## 4. Тестирование
 
-Три уровня, от быстрого к полному.
+### 4.1. Unit-тесты
 
-### 4.1. Unit-тесты (без прокси и сертификатов)
-
-`xfcc_test.go`:
+`client_test.go`:
 
 ```go
 package main
@@ -340,7 +232,10 @@ import (
 )
 
 func TestMiddleware(t *testing.T) {
-	cl := NewCNClassifier([]string{"mcp-gateway"}, []string{"ai-agent"}, nil)
+	cl, err := NewClassifier([]string{`mcp-gateway`})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var got ClientKind
 	h := cl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = ClientKindFrom(r.Context())
@@ -352,56 +247,52 @@ func TestMiddleware(t *testing.T) {
 		wantCode int
 		wantKind ClientKind
 	}{
-		{"gateway", []string{`Hash=abc;Subject="CN=mcp-gateway"`}, 200, ClientGateway},
-		{"agent", []string{`Hash=abc;Subject="CN=ai-agent,O=Acme";URI=spiffe://x`}, 200, ClientAgent},
-		{"cn not first", []string{`Subject="O=Acme,CN=ai-agent"`}, 200, ClientAgent},
-		{"no header", nil, 403, ClientUnknown},
-		{"unknown cn", []string{`Subject="CN=someone"`}, 403, ClientUnknown},
-		{"spoof in earlier element", []string{`Subject="CN=mcp-gateway",Subject="CN=ai-agent"`}, 200, ClientAgent},
-		{"spoof as separate header", []string{`Subject="CN=mcp-gateway"`, `Subject="CN=someone"`}, 403, ClientUnknown},
+		{"gateway", []string{`Hash=abc;Subject="CN=mcp-gateway";URI=`}, 200, ClientGateway},
+		{"agent", []string{`Hash=abc;Subject="CN=ai-agent";URI=`}, 200, ClientAgent},
+		{"any other cn is agent", []string{`Subject="CN=whatever"`}, 200, ClientAgent},
+		{"cn not first in dn", []string{`Subject="O=Acme,CN=mcp-gateway"`}, 200, ClientGateway},
 		{"comma inside quotes", []string{`By=spiffe://a;Subject="CN=mcp-gateway,OU=x,O=y"`}, 200, ClientGateway},
-		{"prefix is not enough", []string{`Subject="CN=mcp-gateway-evil"`}, 403, ClientUnknown},
-		{"no subject", []string{`Hash=abc;URI=spiffe://x`}, 403, ClientUnknown},
+		{"prefix is not enough", []string{`Subject="CN=mcp-gateway-evil"`}, 200, ClientAgent},
+		{"spoof in earlier element", []string{`Subject="CN=mcp-gateway",Hash=b;Subject="CN=ai-agent"`}, 200, ClientAgent},
+		{"spoof as separate header", []string{`Subject="CN=mcp-gateway"`, `Subject="CN=ai-agent"`}, 200, ClientAgent},
+		{"no header", nil, 403, ClientAgent},
+		{"no subject", []string{`Hash=abc;URI=spiffe://x`}, 403, ClientAgent},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got = ClientUnknown
+			got = -1
 			req := httptest.NewRequest("GET", "/", nil)
 			for _, v := range tt.xfcc {
-				req.Header.Add(xfccHeader, v)
+				req.Header.Add("X-Forwarded-Client-Cert", v)
 			}
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
-			if rec.Code != tt.wantCode || got != tt.wantKind {
-				t.Fatalf("code=%d kind=%v, want %d %v", rec.Code, got, tt.wantCode, tt.wantKind)
+			if rec.Code != tt.wantCode {
+				t.Fatalf("code=%d, want %d", rec.Code, tt.wantCode)
+			}
+			if rec.Code == 200 && got != tt.wantKind {
+				t.Fatalf("kind=%v, want %v", got, tt.wantKind)
 			}
 		})
 	}
 }
 
-func TestTrustedProxy(t *testing.T) {
-	gw := "spiffe://cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
-	cl := NewCNClassifier([]string{"mcp-gateway"}, []string{"ai-agent"}, []string{gw})
-	h := cl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	tests := []struct {
-		name string
-		xfcc string
-		want int
-	}{
-		{"via ingress", `Hash=a;Subject="CN=mcp-gateway";URI=,By=spiffe://x;Hash=b;Subject="";URI=` + gw, 200},
-		{"from other workload", `Subject="CN=mcp-gateway",By=spiffe://x;Hash=b;Subject="";URI=spiffe://cluster.local/ns/default/sa/evil`, 403},
-		{"single element", `Hash=b;Subject="CN=mcp-gateway";URI=` + gw, 403},
+func TestGatewayPatterns(t *testing.T) {
+	cl, _ := NewClassifier([]string{`mcp-gateway(-[a-z0-9]+)*`})
+	for cn, want := range map[string]ClientKind{
+		"mcp-gateway":         ClientGateway,
+		"mcp-gateway-1":       ClientGateway,
+		"mcp-gateway-prod-eu": ClientGateway,
+		"mcp-gatewayX":        ClientAgent,
+		"evil-mcp-gateway":    ClientAgent,
+		"ai-agent":            ClientAgent,
+	} {
+		if got := cl.Kind(cn); got != want {
+			t.Errorf("%s: got %v want %v", cn, got, want)
+		}
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", "/", nil)
-			req.Header.Set(xfccHeader, tt.xfcc)
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, req)
-			if rec.Code != tt.want {
-				t.Fatalf("code=%d want %d", rec.Code, tt.want)
-			}
-		})
+	if _, err := NewClassifier([]string{`(`}); err == nil {
+		t.Error("expected error for bad pattern")
 	}
 }
 ```
@@ -410,30 +301,23 @@ func TestTrustedProxy(t *testing.T) {
 go test ./...
 ```
 
-### 4.2. Быстрая ручная проверка: curl с заголовком, без прокси
+### 4.2. Быстрая проверка: curl с заголовком, без прокси
 
-Локально приложение доверяет любому XFCC, поэтому прокси можно сымитировать, просто передав заголовок. Это проверяет логику ветвления, но не mTLS.
+Прокси можно сымитировать, передав заголовок вручную. Так проверяется логика ветвления, но не mTLS.
 
 ```powershell
 $curl = "C:\Program Files\Git\mingw64\bin\curl.exe"
 
-# gateway → ветка gateway
-& $curl -H 'X-Forwarded-Client-Cert: Hash=x;Subject="CN=mcp-gateway"' http://127.0.0.1:8080/
-
-# агент → ветка агента
-& $curl -H 'X-Forwarded-Client-Cert: Hash=x;Subject="CN=ai-agent"' http://127.0.0.1:8080/
-
-# без заголовка → 403
-& $curl http://127.0.0.1:8080/
+& $curl -H 'X-Forwarded-Client-Cert: Hash=x;Subject="CN=mcp-gateway"' http://127.0.0.1:8080/   # gateway
+& $curl -H 'X-Forwarded-Client-Cert: Hash=x;Subject="CN=ai-agent"' http://127.0.0.1:8080/      # агент
+& $curl http://127.0.0.1:8080/                                                                 # 403
 ```
-
-> Этот же тест показывает, почему приложение **нельзя** открывать в обход прокси: заголовок подделывается одной строкой.
 
 ### 4.3. Полная проверка: настоящий mTLS через Envoy в Docker
 
-Понадобятся Docker Desktop и сертификаты из инструкции `mtls-local-certs-windows.md`: `ca.crt`, `server.crt/.key`, `mcp-gateway.crt/.key`, `ai-agent.crt/.key` в папке `certs`.
+Понадобятся Docker Desktop и сертификаты из `mtls-local-certs-windows.md` в папке `certs`.
 
-**1. Запустите приложение на `:8080`**, а не на `127.0.0.1:8080`, иначе Envoy из контейнера до него не достучится. Windows может спросить про брандмауэр: разрешите доступ к частным сетям. Это настройка только для локального теста.
+**1. Запустите приложение на `:8080`**, а не на `127.0.0.1:8080`, чтобы Envoy из контейнера до него достучался. Это настройка только для локального теста.
 
 **2. Создайте `envoy.yaml`** рядом с папкой `certs`:
 
@@ -464,7 +348,6 @@ static_resources:
           set_current_client_cert_details:          # что положить в XFCC
             subject: true
             uri: true
-            dns: true
           route_config:
             virtual_hosts:
             - name: app
@@ -510,7 +393,7 @@ $curl = "C:\Program Files\Git\mingw64\bin\curl.exe"
 # агент → ветка агента
 & $curl --cacert ca.crt --cert ai-agent.crt --key ai-agent.key https://localhost:8443/
 
-# агент пытается выдать себя за gateway через заголовок → всё равно ветка агента
+# агент подставляет заголовок с CN gateway → всё равно агент
 & $curl --cacert ca.crt --cert ai-agent.crt --key ai-agent.key -H 'X-Forwarded-Client-Cert: Subject="CN=mcp-gateway"' https://localhost:8443/
 
 # без клиентского сертификата → Envoy обрывает handshake
@@ -521,25 +404,20 @@ $curl = "C:\Program Files\Git\mingw64\bin\curl.exe"
 
 | Запрос | Результат |
 |---|---|
-| сертификат `mcp-gateway` | ветка gateway, XFCC: `Hash=...;Subject="CN=mcp-gateway";URI=` |
-| сертификат `ai-agent` | ветка агента |
+| сертификат `mcp-gateway` | ветка gateway |
+| сертификат `ai-agent` или любой другой CN от вашего CA | ветка агента |
 | агент + поддельный заголовок | ветка агента: `SANITIZE_SET` выкинул подделку |
 | без сертификата | `alert certificate required` |
 | сертификат не от вашего CA | `alert unknown ca` |
-| валидный сертификат, но чужой CN | `403 forbidden` от приложения |
-
-Для отладки удобно, чтобы тестовый хендлер возвращал `r.Header.Get("X-Forwarded-Client-Cert")`: так видно, что именно передал прокси.
 
 ---
 
 ## 5. Чек-лист перед продом
 
 - [ ] Из Go-сервера убран TLS, сервер слушает HTTP.
-- [ ] Приложение недоступно в обход прокси (`127.0.0.1` для sidecar; Istio `PeerAuthentication: STRICT`; нет прямых Service/NodePort на порт приложения).
+- [ ] Приложение недоступно в обход прокси.
 - [ ] В прокси `forward_client_cert_details` = `SANITIZE_SET` или `APPEND_FORWARD`, **не** `FORWARD_ONLY`.
-- [ ] В прокси включено `subject: true` в `set_current_client_cert_details`.
-- [ ] Реальный XFCC на окружении посмотрен в логах, понятно, сколько в нём элементов.
-- [ ] Если прокси больше одного (ingress → sidecar), заполнен `trusted_proxy_uris`.
-- [ ] Если клиенты внутри mesh без CN, различение переделано на `URI` (SPIFFE).
-- [ ] Для MCP-маршрута отключён таймаут ответа (`timeout: 0s` или аналог), иначе прокси оборвёт стриминг.
-- [ ] Отказы логируются с CN, а временное логирование всего XFCC убрано.
+- [ ] В прокси включено `subject: true`.
+- [ ] Реальный XFCC на окружении посмотрен в логах: элемент один (если два, см. раздел 3).
+- [ ] Шаблоны `gateway_cns` узкие, без `.*` в конце.
+- [ ] Для MCP-маршрута отключён таймаут ответа (`timeout: 0s`), иначе прокси оборвёт стриминг.
