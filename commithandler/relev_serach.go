@@ -11,10 +11,11 @@ import (
 )
 
 // TrackerProvider — клиент трекера задач.
-// Получает ключи задач и возвращает только те, которые в трекере реально есть.
+// Получает трекер и ключи задач, возвращает только те задачи, которые там реально есть.
+// Один клиент может обслуживать несколько трекеров (jira: sigma и delta).
 // Разбивку ключей на пачки (лимиты JQL/TQL) делает сам клиент.
 type TrackerProvider interface {
-	SearchIssues(ctx context.Context, issueKeys []string) ([]entity.TrackerIssue, error)
+	SearchIssues(ctx context.Context, tracker entity.Tracker, issueKeys []string) ([]entity.TrackerIssue, error)
 }
 
 // RelevantIssueSearchInput — входные данные для поиска.
@@ -26,21 +27,18 @@ type RelevantIssueSearchInput struct {
 // sbertrack, jira sigma или jira delta.
 type RelevantIssueSearchAction struct {
 	sbertrack TrackerProvider
-	jiraSigma TrackerProvider
-	jiraDelta TrackerProvider
+	jira      TrackerProvider // обслуживает и sigma, и delta
 	logger    *slog.Logger
 }
 
 func NewRelevantIssueSearchAction(
 	sbertrack TrackerProvider,
-	jiraSigma TrackerProvider,
-	jiraDelta TrackerProvider,
+	jira TrackerProvider,
 	logger *slog.Logger,
 ) *RelevantIssueSearchAction {
 	return &RelevantIssueSearchAction{
 		sbertrack: sbertrack,
-		jiraSigma: jiraSigma,
-		jiraDelta: jiraDelta,
+		jira:      jira,
 		logger:    logger,
 	}
 }
@@ -66,12 +64,12 @@ func (a *RelevantIssueSearchAction) Execute(ctx context.Context, input RelevantI
 		return nil, err
 	}
 
-	jiraSigmaIssues, err := searchByKey(ctx, a.jiraSigma, entity.TrackerJiraSigma, issueKeys)
+	jiraSigmaIssues, err := searchByKey(ctx, a.jira, entity.TrackerJiraSigma, issueKeys)
 	if err != nil {
 		return nil, err
 	}
 
-	jiraDeltaIssues, err := searchByKey(ctx, a.jiraDelta, entity.TrackerJiraDelta, issueKeys)
+	jiraDeltaIssues, err := searchByKey(ctx, a.jira, entity.TrackerJiraDelta, issueKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +131,7 @@ func closerToCommit(commitDate time.Time, first, second *entity.TrackerIssue) *e
 
 // searchByKey ищет задачи в трекере, проставляет им трекер и раскладывает по ключу.
 func searchByKey(ctx context.Context, provider TrackerProvider, tracker entity.Tracker, issueKeys []string) (map[string]*entity.TrackerIssue, error) {
-	foundIssues, err := provider.SearchIssues(ctx, issueKeys)
+	foundIssues, err := provider.SearchIssues(ctx, tracker, issueKeys)
 	if err != nil {
 		return nil, fmt.Errorf("search issues in %s: %w", tracker, err)
 	}
