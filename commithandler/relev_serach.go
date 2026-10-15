@@ -4,48 +4,37 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+
+	"example.com/ris/entity"
 )
 
-// GitIssue — задача, найденная в коммите (например, ключ из commit message).
-type GitIssue struct {
-	Key        string    // ключ задачи, например "PROJ-123"
-	CommitHash string    // хеш коммита, в котором упомянута задача
-	CommitDate time.Time // дата коммита
-}
-
-// SearchedIssue — задача, найденная в одном из трекеров.
-type SearchedIssue struct {
-	GitIssue  GitIssue  // исходная задача из коммита, по ней сопоставляем результаты
-	Tracker   string    // в каком трекере нашли (значение IssueProvider.Type())
-	CreatedAt time.Time // дата создания задачи в трекере
-}
-
-// IssueProvider — трекер задач, в котором можно искать задачи из коммитов.
-// Возвращает только найденные задачи, ненайденные просто отсутствуют в ответе.
-type IssueProvider interface {
-	SearchIssue(ctx context.Context, issues []GitIssue) ([]SearchedIssue, error)
-	Type() string
+// TrackerProvider — клиент трекера задач.
+// Получает ключи задач и возвращает только те, которые в трекере реально есть.
+// Разбивку ключей на пачки (лимиты JQL/TQL) делает сам клиент.
+type TrackerProvider interface {
+	SearchIssues(ctx context.Context, issueKeys []string) ([]entity.TrackerIssue, error)
 }
 
 // RelevantIssueSearchInput — входные данные для поиска.
 type RelevantIssueSearchInput struct {
-	GitIssues []GitIssue
+	GitIssues []entity.GitIssue
 }
 
-// RelevantIssueSearchAction определяет, к какому трекеру относится каждая задача:
+// RelevantIssueSearchAction определяет, к какому трекеру относится каждая задача из коммитов:
 // sbertrack, jira sigma или jira delta.
 type RelevantIssueSearchAction struct {
-	sbertrack IssueProvider
-	jiraSigma IssueProvider
-	jiraDelta IssueProvider
+	sbertrack TrackerProvider
+	jiraSigma TrackerProvider
+	jiraDelta TrackerProvider
 	logger    *slog.Logger
 }
 
 func NewRelevantIssueSearchAction(
-	sbertrack IssueProvider,
-	jiraSigma IssueProvider,
-	jiraDelta IssueProvider,
+	sbertrack TrackerProvider,
+	jiraSigma TrackerProvider,
+	jiraDelta TrackerProvider,
 	logger *slog.Logger,
 ) *RelevantIssueSearchAction {
 	return &RelevantIssueSearchAction{
@@ -61,33 +50,41 @@ func NewRelevantIssueSearchAction(
 // Правила выбора:
 //   - нашлась только в одном трекере -> выбираем его
 //   - sbertrack + любая jira          -> выбираем sbertrack
-//   - sigma + delta (без sbertrack)   -> выбираем ту, что ближе к дате коммита
+//   - sigma + delta (без sbertrack)   -> выбираем ту, что создана ближе к дате коммита
 //   - нигде не нашлась                -> логируем как потеряшку
 //
 // Порядок результата совпадает с порядком input.GitIssues (без потеряшек).
-func (a *RelevantIssueSearchAction) Execute(ctx context.Context, input RelevantIssueSearchInput) ([]SearchedIssue, error) {
-	sbertrackIssues, err := searchByKey(ctx, a.sbertrack, input.GitIssues)
+func (a *RelevantIssueSearchAction) Execute(ctx context.Context, input RelevantIssueSearchInput) ([]entity.SearchedIssue, error) {
+	if len(input.GitIssues) == 0 {
+		return nil, nil
+	}
+
+	issueKeys := uniqueIssueKeys(input.GitIssues)
+
+	sbertrackIssues, err := searchByKey(ctx, a.sbertrack, entity.TrackerSbertrack, issueKeys)
 	if err != nil {
 		return nil, err
 	}
 
-	jiraSigmaIssues, err := searchByKey(ctx, a.jiraSigma, input.GitIssues)
+	jiraSigmaIssues, err := searchByKey(ctx, a.jiraSigma, entity.TrackerJiraSigma, issueKeys)
 	if err != nil {
 		return nil, err
 	}
 
-	jiraDeltaIssues, err := searchByKey(ctx, a.jiraDelta, input.GitIssues)
+	jiraDeltaIssues, err := searchByKey(ctx, a.jiraDelta, entity.TrackerJiraDelta, issueKeys)
 	if err != nil {
 		return nil, err
 	}
 
-	relevantIssues := make([]SearchedIssue, 0, len(input.GitIssues))
+	searchedIssues := make([]entity.SearchedIssue, 0, len(input.GitIssues))
 	for _, gitIssue := range input.GitIssues {
+		issueKey := normalizeIssueKey(gitIssue.Key)
+
 		relevantIssue := chooseRelevantIssue(
 			gitIssue.CommitDate,
-			sbertrackIssues[gitIssue.Key],
-			jiraSigmaIssues[gitIssue.Key],
-			jiraDeltaIssues[gitIssue.Key],
+			sbertrackIssues[issueKey],
+			jiraSigmaIssues[issueKey],
+			jiraDeltaIssues[issueKey],
 		)
 
 		if relevantIssue == nil {
@@ -98,15 +95,18 @@ func (a *RelevantIssueSearchAction) Execute(ctx context.Context, input RelevantI
 			continue
 		}
 
-		relevantIssues = append(relevantIssues, *relevantIssue)
+		searchedIssues = append(searchedIssues, entity.SearchedIssue{
+			GitIssue:     gitIssue,
+			TrackerIssue: *relevantIssue,
+		})
 	}
 
-	return relevantIssues, nil
+	return searchedIssues, nil
 }
 
 // chooseRelevantIssue выбирает задачу по правилам из Execute.
-// nil на входе — задача в этом трекере не найдена; nil на выходе — не найдена нигде.
-func chooseRelevantIssue(commitDate time.Time, sbertrackIssue, jiraSigmaIssue, jiraDeltaIssue *SearchedIssue) *SearchedIssue {
+// nil на входе — в этом трекере задача не найдена; nil на выходе — не найдена нигде.
+func chooseRelevantIssue(commitDate time.Time, sbertrackIssue, jiraSigmaIssue, jiraDeltaIssue *entity.TrackerIssue) *entity.TrackerIssue {
 	switch {
 	case sbertrackIssue != nil:
 		return sbertrackIssue
@@ -121,7 +121,7 @@ func chooseRelevantIssue(commitDate time.Time, sbertrackIssue, jiraSigmaIssue, j
 
 // closerToCommit возвращает задачу, созданную ближе к дате коммита.
 // При равенстве выбирается first.
-func closerToCommit(commitDate time.Time, first, second *SearchedIssue) *SearchedIssue {
+func closerToCommit(commitDate time.Time, first, second *entity.TrackerIssue) *entity.TrackerIssue {
 	firstDistance := first.CreatedAt.Sub(commitDate).Abs()
 	secondDistance := second.CreatedAt.Sub(commitDate).Abs()
 
@@ -131,21 +131,40 @@ func closerToCommit(commitDate time.Time, first, second *SearchedIssue) *Searche
 	return first
 }
 
-// searchByKey ищет задачи в трекере и раскладывает их по ключу задачи.
-// Если трекер вернул несколько результатов на один ключ, берём первый.
-func searchByKey(ctx context.Context, provider IssueProvider, gitIssues []GitIssue) (map[string]*SearchedIssue, error) {
-	foundIssues, err := provider.SearchIssue(ctx, gitIssues)
+// searchByKey ищет задачи в трекере, проставляет им трекер и раскладывает по ключу.
+func searchByKey(ctx context.Context, provider TrackerProvider, tracker entity.Tracker, issueKeys []string) (map[string]*entity.TrackerIssue, error) {
+	foundIssues, err := provider.SearchIssues(ctx, issueKeys)
 	if err != nil {
-		return nil, fmt.Errorf("search issues in %s: %w", provider.Type(), err)
+		return nil, fmt.Errorf("search issues in %s: %w", tracker, err)
 	}
 
-	issuesByKey := make(map[string]*SearchedIssue, len(foundIssues))
+	issuesByKey := make(map[string]*entity.TrackerIssue, len(foundIssues))
 	for i := range foundIssues {
-		key := foundIssues[i].GitIssue.Key
-		if _, exists := issuesByKey[key]; !exists {
-			issuesByKey[key] = &foundIssues[i]
-		}
+		foundIssues[i].Tracker = tracker
+		issuesByKey[normalizeIssueKey(foundIssues[i].Key)] = &foundIssues[i]
 	}
 
 	return issuesByKey, nil
+}
+
+// uniqueIssueKeys собирает ключи без дублей: одна задача может быть в нескольких коммитах.
+func uniqueIssueKeys(gitIssues []entity.GitIssue) []string {
+	seenKeys := make(map[string]struct{}, len(gitIssues))
+	issueKeys := make([]string, 0, len(gitIssues))
+
+	for _, gitIssue := range gitIssues {
+		issueKey := normalizeIssueKey(gitIssue.Key)
+		if _, seen := seenKeys[issueKey]; seen {
+			continue
+		}
+		seenKeys[issueKey] = struct{}{}
+		issueKeys = append(issueKeys, issueKey)
+	}
+
+	return issueKeys
+}
+
+// normalizeIssueKey приводит ключ к виду, в котором его возвращают трекеры ("proj-1 " -> "PROJ-1").
+func normalizeIssueKey(issueKey string) string {
+	return strings.ToUpper(strings.TrimSpace(issueKey))
 }
